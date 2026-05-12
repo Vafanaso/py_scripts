@@ -27,20 +27,23 @@ import yaml
 CAM_RE = re.compile(r"^cam\d+$")
 
 
-def get_Ts_from_json(data: dict) -> dict[str, np.ndarray]:
+def get_Ts_from_json(data: dict) -> tuple[dict[str, np.ndarray], bool]:
     """Recover per-camera lidar-frame poses from a Mosaic JSON camchain.
 
     In this format R and t encode cam_n's pose in cam0's local frame. If cam0
     carries `T_c0_lidar`, we compose with its inverse to lift each pose into
     the lidar frame (matches what the YAML path computes). If T_c0_lidar is
     absent, cam0 IS the reference and poses are returned in cam0's frame.
+
+    Returns (poses, has_lidar_reference).
     """
     poses: dict[str, np.ndarray] = {}
     cams = data.get("cams", {})
     cam0 = cams.get("cam0", {})
+    has_lidar = "T_c0_lidar" in cam0
     T_lidar_cam0 = (
         np.linalg.inv(np.asarray(cam0["T_c0_lidar"], dtype=float))
-        if "T_c0_lidar" in cam0 else np.eye(4)
+        if has_lidar else np.eye(4)
     )
     for cam_name, cam_data in cams.items():
         if not CAM_RE.match(cam_name):
@@ -51,11 +54,18 @@ def get_Ts_from_json(data: dict) -> dict[str, np.ndarray]:
         M_cam0[:3, :3] = R
         M_cam0[:3, 3] = t
         poses[cam_name] = T_lidar_cam0 @ M_cam0
-    return poses
+    return poses, has_lidar
 
 
-def get_Ts_from_yaml(data: dict) -> dict[str, np.ndarray]:
+def get_Ts_from_yaml(data: dict) -> tuple[dict[str, np.ndarray], bool]:
+    """Walk the YAML chain to produce per-camera poses in the reference frame.
+
+    Returns (poses, has_lidar_reference). Reference is the lidar frame when
+    cam0 carries `T_c0_lidar`; otherwise cam0 itself is the reference (and
+    cam0's pose comes out as identity).
+    """
     poses: dict[str, np.ndarray] = {}
+    has_lidar = "T_c0_lidar" in data.get("cam0", {})
     Tinv = np.eye(4)
     for cam_name, entry in data.items():
         if not CAM_RE.match(cam_name):
@@ -70,10 +80,10 @@ def get_Ts_from_yaml(data: dict) -> dict[str, np.ndarray]:
             raise ValueError(f"{cam_name} chain matrix must be 4x4 (got {T_chain.shape}).")
         Tinv = Tinv @ np.linalg.inv(T_chain)
         poses[cam_name] = Tinv.copy()
-    return poses
+    return poses, has_lidar
 
 
-def load_poses(path: Path) -> dict[str, np.ndarray]:
+def load_poses(path: Path) -> tuple[dict[str, np.ndarray], bool]:
     suffix = path.suffix.lower()
     if suffix == ".json":
         with open(path, "r") as f:
@@ -84,7 +94,8 @@ def load_poses(path: Path) -> dict[str, np.ndarray]:
     raise ValueError(f"Unsupported calibration suffix: {suffix!r} (expected .json, .yaml, or .yml).")
 
 
-def visualize_cam_poses(poses: dict[str, np.ndarray]) -> None:
+def visualize_cam_poses(poses: dict[str, np.ndarray], has_lidar: bool) -> None:
+    """Render cameras + the reference frame (lidar if available, else cam0)."""
     if not poses:
         print("No camera poses to display.", file=sys.stderr)
         return
@@ -101,8 +112,16 @@ def visualize_cam_poses(poses: dict[str, np.ndarray]) -> None:
         vis.add_geometry(cam_name, mesh)
         vis.add_3d_label(T[:3, 3], cam_name)
 
-    origin = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-    vis.add_geometry("origin", origin)
+    # The origin of the displayed frame is the lidar when T_c0_lidar is known,
+    # otherwise cam0 itself. Make it visually distinct from the cameras: bigger
+    # axes and a clear label so the user can see which device is the reference.
+    if has_lidar:
+        ref_size, ref_name = 0.20, "lidar"
+    else:
+        ref_size, ref_name = 0.12, "cam0 (reference)"
+    ref_mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=ref_size)
+    vis.add_geometry(ref_name, ref_mesh)
+    vis.add_3d_label([0.0, 0.0, 0.0], ref_name)
 
     vis.reset_camera_to_default()
     app.add_window(vis)
@@ -114,6 +133,10 @@ if __name__ == "__main__":
     parser.add_argument("config", type=Path, help="Path to the calibration file (.yaml or .json).")
     args = parser.parse_args()
 
-    poses = load_poses(args.config)
-    print(f"Loaded {len(poses)} camera poses from {args.config.name}: {', '.join(poses.keys())}")
-    visualize_cam_poses(poses)
+    poses, has_lidar = load_poses(args.config)
+    reference = "lidar" if has_lidar else "cam0"
+    print(
+        f"Loaded {len(poses)} camera poses from {args.config.name} "
+        f"({', '.join(poses.keys())}); reference frame = {reference}."
+    )
+    visualize_cam_poses(poses, has_lidar)
