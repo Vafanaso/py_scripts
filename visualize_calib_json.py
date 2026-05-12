@@ -28,17 +28,29 @@ CAM_RE = re.compile(r"^cam\d+$")
 
 
 def get_Ts_from_json(data: dict) -> dict[str, np.ndarray]:
+    """Recover per-camera lidar-frame poses from a Mosaic JSON camchain.
+
+    In this format R and t encode cam_n's pose in cam0's local frame. If cam0
+    carries `T_c0_lidar`, we compose with its inverse to lift each pose into
+    the lidar frame (matches what the YAML path computes). If T_c0_lidar is
+    absent, cam0 IS the reference and poses are returned in cam0's frame.
+    """
     poses: dict[str, np.ndarray] = {}
     cams = data.get("cams", {})
+    cam0 = cams.get("cam0", {})
+    T_lidar_cam0 = (
+        np.linalg.inv(np.asarray(cam0["T_c0_lidar"], dtype=float))
+        if "T_c0_lidar" in cam0 else np.eye(4)
+    )
     for cam_name, cam_data in cams.items():
         if not CAM_RE.match(cam_name):
             continue
         R = np.asarray(cam_data["R"], dtype=float)
         t = np.asarray(cam_data["t"], dtype=float).reshape(3)
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = t
-        poses[cam_name] = T
+        M_cam0 = np.eye(4)
+        M_cam0[:3, :3] = R
+        M_cam0[:3, 3] = t
+        poses[cam_name] = T_lidar_cam0 @ M_cam0
     return poses
 
 

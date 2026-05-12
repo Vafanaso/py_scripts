@@ -1,25 +1,29 @@
 """Convert a Mosaic Kalibr-style YAML calibration to the Mosaic JSON camchain.
 
-This is the exact inverse of `trajectory/utils/camera.py::_parse_json`
-(in the external `trajectory` package). That function, given a JSON camchain,
-walks the cameras in order and produces an in-memory dict shaped like the YAML
-calibration. This script does the reverse: it consumes the YAML and emits a JSON
-that, when fed back through `_parse_json`, reproduces the original YAML chain.
+Output format matches the production Mosaic JSON (Ilia Shipachev's converter):
+- Per camera, `R` and `t` encode cam_n's pose **in cam0's local frame**
+  (M_0 = identity; M_n = M_{n-1} @ inv(T_cn_cnm1)).
+- cam0 keeps `T_c0_lidar` from the YAML when present — that's the signal
+  the parser uses to recover lidar-frame poses. JSONs without `T_c0_lidar`
+  are valid; the resulting trajectories are then in cam0's frame.
+- No top-level `lidars` key (that was an artifact of an earlier draft).
+- Top-level `serial`, `model`, `pixel_size_mm`, `reassembly_number` lifted
+  from `calibration_info.chamber.device_info` (or legacy top-level
+  `device_info`) when present.
+- `horizontally_flipped: true` added to cam1 and cam2 for M51 rigs.
 
-Forward (parser) transformation, per camera n with T_prev starting at identity:
-    M_n      = [[R_n | t_n], [0 | 1]]            # built from JSON
-    T_chain  = inv(M_n) @ T_prev                  # stored as YAML key
-    T_prev   = M_n                                # propagated to next cam
-The YAML key is `T_c0_lidar` for cam0 (only emitted when the JSON has a
-top-level `lidars` entry) and `T_cn_cnm1` otherwise.
+The math through `trajectory/utils/camera.py::_parse_json` +
+`get_cameras_parameters` recovers, for each camera:
+    Tinv_cam0 = inv(T_c0_lidar)   if T_c0_lidar present
+              = I                  otherwise
+    Tinv_cam_n = Tinv_cam_{n-1} @ inv(T_cn_cnm1_recovered)
+which is identical to what walking the YAML directly produces — verified
+end-to-end by `verify_roundtrip` below.
 
-Inverse (this script):
-    M_0 = inv(T_c0_lidar)                         # or identity when absent
-    M_n = M_{n-1} @ inv(T_cn_cnm1)   for n >= 1
-    R_n = M_n[:3, :3];  t_n = M_n[:3, 3]
-
-The script verifies its own output by replaying the parser on the produced
-JSON and checking the recovered chain matches the input YAML.
+Note: this JSON will NOT pass mopro's current `check_camera_json` with
+`require_lid2cam=True`, because that validator requires a top-level `lidars`
+key. The validator is stricter than the parser can handle and should be
+fixed in tandem (separate change to mopro itself).
 """
 
 from __future__ import annotations
@@ -34,32 +38,73 @@ import numpy as np
 import yaml
 
 
-CAM_RE = re.compile(r"^cam(\d+)$")
+CAM_RE = re.compile(r"^cam\d+$")
 PASSTHROUGH_KEYS = ("distortion_coeffs", "distortion_model", "intrinsics", "resolution")
+PIXEL_SIZE_MM = {
+    "M51D3": 1.55e-3,
+    "MXD3": 2.74e-3,
+    "XPD3": 2.74e-3,
+    "Viking": 3.45e-3,
+}
 
 
 def _ordered_cam_keys(data: dict) -> list[str]:
-    """Return the camN keys in the dict's insertion order.
+    """Return camN keys in the dict's insertion order.
 
-    Insertion order is load-bearing: the parser at trajectory/utils/camera.py
-    walks `chain_json["cams"].keys()` in insertion order, and each non-cam0
-    camera's `T_cn_cnm1` is interpreted as "relative to the previous camera in
-    the file". For Mosaic rigs cam4 is intentionally listed last (after cam5)
-    because it sits at the panorama stitching seam, so sorting by integer
-    suffix would mis-chain cam4 and cam5.
+    Insertion order is load-bearing: the YAML's `T_cn_cnm1` is "relative to
+    whatever came right before me in the file." Mosaic rigs put cam4 last
+    (panorama stitching seam), so sorting by integer would mis-chain it.
     """
     return [key for key in data.keys() if CAM_RE.match(key)]
 
 
+def _extract_device_info(yaml_data: dict) -> dict:
+    """Extract Mosaic device metadata from the YAML's calibration_info block, with fallbacks."""
+    nested = yaml_data.get("calibration_info", {}).get("chamber", {}).get("device_info", {})
+    flat = yaml_data.get("device_info", {})
+    yaml_di = {**flat, **nested}  # nested takes precedence on overlap
+
+    info: dict = {}
+
+    sn = yaml_di.get("serial_number")
+    if sn is not None:
+        info["serial"] = sn
+
+    # Model: prefer hw_version ("RZSN0215, M51D3" -> "M51D3"); else probe fw_version.
+    hw = yaml_di.get("hw_version", "")
+    model = None
+    if hw and "," in hw:
+        model = hw.split(",", 1)[1].strip()
+    else:
+        fw = (yaml_di.get("fw_version") or "").lower()
+        for token, label in (("m51", "M51D3"), ("mx", "MXD3"), ("xp", "XPD3"), ("viking", "Viking")):
+            if token in fw:
+                model = label
+                break
+    if model:
+        info["model"] = model
+        if model in PIXEL_SIZE_MM:
+            info["pixel_size_mm"] = PIXEL_SIZE_MM[model]
+
+    rn = yaml_di.get("reassembly_number")
+    if rn is not None:
+        info["reassembly_number"] = rn
+
+    return info
+
+
 def yaml_chain_to_json_camchain(yaml_data: dict) -> dict:
-    """Return a JSON-camchain dict equivalent to the input YAML calibration."""
+    """Convert a parsed YAML calibration to the Mosaic-internal-style JSON camchain dict."""
     cam_keys = _ordered_cam_keys(yaml_data)
     if not cam_keys:
-        raise ValueError("No camN entries found in the YAML root.")
+        raise ValueError("No camN entries found in YAML root.")
     if cam_keys[0] != "cam0":
         raise ValueError(f"Camera chain must start at cam0 (found {cam_keys[0]}).")
 
     has_lidar = "T_c0_lidar" in yaml_data["cam0"]
+    device_info = _extract_device_info(yaml_data)
+    is_m51 = (device_info.get("model") or "").upper().startswith("M51")
+    flipped_cams = {"cam1", "cam2"} if is_m51 else set()
 
     cams_json: dict[str, dict] = {}
     M_prev = np.eye(4)
@@ -70,16 +115,8 @@ def yaml_chain_to_json_camchain(yaml_data: dict) -> dict:
             raise ValueError(f"{cam} entry must be a mapping.")
 
         if idx == 0:
-            if has_lidar:
-                T_c0_lidar = np.asarray(cam_data["T_c0_lidar"], dtype=float)
-                if T_c0_lidar.shape != (4, 4):
-                    raise ValueError(f"{cam}.T_c0_lidar must be 4x4 (got {T_c0_lidar.shape}).")
-                M = np.linalg.inv(T_c0_lidar)
-            else:
-                # cam0 still needs R/t to satisfy the validator; identity is the
-                # neutral choice and matches what _parse_json effectively sees
-                # (it pops R/t but skips the matrix build when "lidars" is absent).
-                M = np.eye(4)
+            # cam0 is the reference frame; its pose in cam0's frame is identity.
+            M = np.eye(4)
         else:
             if "T_cn_cnm1" not in cam_data:
                 raise ValueError(f"{cam} is missing required key 'T_cn_cnm1'.")
@@ -96,8 +133,14 @@ def yaml_chain_to_json_camchain(yaml_data: dict) -> dict:
             if key not in cam_data:
                 raise ValueError(f"{cam} is missing required key '{key}'.")
             cam_json[key] = cam_data[key]
+        if cam == "cam0" and has_lidar:
+            cam_json["T_c0_lidar"] = cam_data["T_c0_lidar"]
+        if cam in flipped_cams:
+            cam_json["horizontally_flipped"] = True
         for key, value in cam_data.items():
-            if key in cam_json or key in ("T_c0_lidar", "T_cn_cnm1"):
+            # T_cn_cnm1 is reconstructed from R/t; never echo it back verbatim.
+            # T_c0_lidar is handled above (only kept on cam0).
+            if key in cam_json or key in ("T_cn_cnm1", "T_c0_lidar"):
                 continue
             cam_json[key] = value
 
@@ -105,16 +148,14 @@ def yaml_chain_to_json_camchain(yaml_data: dict) -> dict:
         M_prev = M
 
     result: dict = {"cams": cams_json}
-    if has_lidar:
-        # The parser only checks for presence of this key. Empty dict is enough.
-        result["lidars"] = {}
-    if "calibration_info" in yaml_data:
-        result["calibration_info"] = yaml_data["calibration_info"]
+    for key in ("serial", "model", "pixel_size_mm", "reassembly_number"):
+        if device_info.get(key) is not None:
+            result[key] = device_info[key]
     return result
 
 
 def _replay_parser(json_data: dict) -> dict:
-    """Faithful reimplementation of `trajectory/utils/camera.py::_parse_json` on an in-memory dict."""
+    """Faithful reimplementation of trajectory/utils/camera.py::_parse_json on an in-memory dict."""
     chain: dict[str, dict] = {}
     T_prev = np.eye(4)
     for cam in json_data["cams"].keys():
@@ -133,26 +174,55 @@ def _replay_parser(json_data: dict) -> dict:
     return chain
 
 
+def _yaml_to_tinv(yaml_data: dict) -> dict[str, np.ndarray]:
+    """Replicate get_cameras_parameters' YAML path: per-camera Tinv = cam->reference pose."""
+    cam_keys = _ordered_cam_keys(yaml_data)
+    result: dict[str, np.ndarray] = {}
+    Tinv = np.eye(4)
+    for idx, cam in enumerate(cam_keys):
+        entry = yaml_data[cam]
+        if idx == 0:
+            T = np.asarray(entry["T_c0_lidar"], dtype=float) if "T_c0_lidar" in entry else np.eye(4)
+        else:
+            T = np.asarray(entry["T_cn_cnm1"], dtype=float)
+        Tinv = Tinv @ np.linalg.inv(T)
+        result[cam] = Tinv.copy()
+    return result
+
+
+def _json_to_tinv(json_data: dict) -> dict[str, np.ndarray]:
+    """Replicate _parse_json + get_cameras_parameters on the produced JSON dict."""
+    chain = _replay_parser(json_data)
+    result: dict[str, np.ndarray] = {}
+    Tinv = np.eye(4)
+    for cam in chain.keys():
+        if cam != "cam0":
+            T = np.asarray(chain[cam]["T_cn_cnm1"], dtype=float)
+        elif "T_c0_lidar" in chain["cam0"]:
+            T = np.asarray(chain["cam0"]["T_c0_lidar"], dtype=float)
+        else:
+            T = np.eye(4)
+        Tinv = Tinv @ np.linalg.inv(T)
+        result[cam] = Tinv.copy()
+    return result
+
+
 def verify_roundtrip(yaml_data: dict, json_data: dict, atol: float = 1e-9) -> None:
-    """Run the parser on the produced JSON and confirm the recovered chain matches the YAML input."""
-    replayed = _replay_parser(json_data)
+    """Verify the produced JSON yields the same per-camera Tinv as the source YAML."""
+    yaml_tinv = _yaml_to_tinv(yaml_data)
+    json_tinv = _json_to_tinv(json_data)
+    if set(yaml_tinv) != set(json_tinv):
+        raise AssertionError(
+            f"Camera sets differ: YAML={sorted(yaml_tinv)} vs JSON={sorted(json_tinv)}"
+        )
+    for cam in yaml_tinv:
+        diff = float(np.max(np.abs(yaml_tinv[cam] - json_tinv[cam])))
+        if diff > atol:
+            raise AssertionError(f"Tinv mismatch on {cam}: max abs diff = {diff:g}")
     for cam in _ordered_cam_keys(yaml_data):
-        original = yaml_data[cam]
-        recovered = replayed[cam]
-        for pose_key in ("T_c0_lidar", "T_cn_cnm1"):
-            if pose_key in original:
-                if pose_key not in recovered:
-                    raise AssertionError(f"Round-trip lost {cam}.{pose_key}.")
-                a = np.asarray(original[pose_key], dtype=float)
-                b = np.asarray(recovered[pose_key], dtype=float)
-                if not np.allclose(a, b, atol=atol):
-                    diff = float(np.max(np.abs(a - b)))
-                    raise AssertionError(
-                        f"Round-trip pose mismatch on {cam}.{pose_key}: max abs diff = {diff:g}."
-                    )
         for key in PASSTHROUGH_KEYS:
-            if original.get(key) != recovered.get(key):
-                raise AssertionError(f"Round-trip mismatch on {cam}.{key}.")
+            if yaml_data[cam].get(key) != json_data["cams"][cam].get(key):
+                raise AssertionError(f"Pass-through field mismatch on {cam}.{key}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -170,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
         "--atol",
         type=float,
         default=1e-9,
-        help="Absolute tolerance for round-trip pose comparison (default 1e-9).",
+        help="Absolute tolerance for round-trip Tinv comparison (default 1e-9).",
     )
     args = parser.parse_args(argv)
 
