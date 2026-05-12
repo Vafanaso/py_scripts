@@ -39,13 +39,16 @@ PASSTHROUGH_KEYS = ("distortion_coeffs", "distortion_model", "intrinsics", "reso
 
 
 def _ordered_cam_keys(data: dict) -> list[str]:
-    cams = []
-    for key in data.keys():
-        match = CAM_RE.match(key)
-        if match:
-            cams.append((int(match.group(1)), key))
-    cams.sort()
-    return [name for _, name in cams]
+    """Return the camN keys in the dict's insertion order.
+
+    Insertion order is load-bearing: the parser at trajectory/utils/camera.py
+    walks `chain_json["cams"].keys()` in insertion order, and each non-cam0
+    camera's `T_cn_cnm1` is interpreted as "relative to the previous camera in
+    the file". For Mosaic rigs cam4 is intentionally listed last (after cam5)
+    because it sits at the panorama stitching seam, so sorting by integer
+    suffix would mis-chain cam4 and cam5.
+    """
+    return [key for key in data.keys() if CAM_RE.match(key)]
 
 
 def yaml_chain_to_json_camchain(yaml_data: dict) -> dict:
