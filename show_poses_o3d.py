@@ -279,6 +279,17 @@ def main():
     for cam_idx, cam in enumerate(sorted_cams):
         c = CAM_COLORS[cam_idx % len(CAM_COLORS)]
         print(f"  {cam}: RGB ({c[0]:.2f}, {c[1]:.2f}, {c[2]:.2f})")
+
+    print("\nFirst-frame raw pose values per camera (XMP / EXIF):")
+    print(f"  {'cam':<6} {'heading':>10} {'pitch':>10} {'roll':>10}   file")
+    for cam in sorted_cams:
+        r = cam_poses[cam][0]
+        print(
+            f"  {cam:<6} {r['heading']:>10.3f} {r['pitch']:>10.3f} "
+            f"{r['roll']:>10.3f}   {r['file']}"
+        )
+    print("Adjacent cams on a 360 rig should differ by ~60 deg in heading.")
+    print("Identical numbers between two cams = a duplicate-trajectory bug.")
     print("\nLarge triad at origin = world ENU (red=E, green=N, blue=Up).")
     print("Drag to rotate, scroll to zoom, right-drag to pan. Press Q to quit.")
 
