@@ -169,15 +169,14 @@ def euler_to_rotmat(heading_deg, pitch_deg, roll_deg) -> np.ndarray:
 
 def make_frustum(position, R, depth, hfov_deg, vfov_deg, color):
     """
-    Build a wireframe camera frustum as an Open3D LineSet.
+    Build a SOLID camera frustum as an Open3D TriangleMesh (open at the back).
 
     The apex is at `position`. The forward axis (body Y) points down the
     optical axis. Base is at distance `depth` ahead, sized by hfov/vfov.
     """
-    hw = depth * np.tan(np.deg2rad(hfov_deg) / 2)  # half width  along body x
-    hh = depth * np.tan(np.deg2rad(vfov_deg) / 2)  # half height along body z
+    hw = depth * np.tan(np.deg2rad(hfov_deg) / 2)
+    hh = depth * np.tan(np.deg2rad(vfov_deg) / 2)
 
-    # 5 points in body frame: apex + 4 base corners
     body_pts = np.array([
         [0.0, 0.0, 0.0],          # 0 apex
         [+hw, depth, +hh],        # 1 top-right
@@ -188,18 +187,29 @@ def make_frustum(position, R, depth, hfov_deg, vfov_deg, color):
 
     world_pts = (R @ body_pts.T).T + np.asarray(position)
 
-    lines = [
-        [0, 1], [0, 2], [0, 3], [0, 4],   # apex to corners
-        [1, 2], [2, 3], [3, 4], [4, 1],   # base rectangle
-        [1, 2],                           # (top edge highlighted by repeat)
-    ]
+    # 4 side triangles only (no base) so you can see "through" the back of
+    # the frustum and it still reads as a camera shape.
+    triangles = np.array([
+        [0, 1, 2],
+        [0, 2, 3],
+        [0, 3, 4],
+        [0, 4, 1],
+    ])
 
-    ls = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(world_pts),
-        lines=o3d.utility.Vector2iVector(lines),
-    )
-    ls.colors = o3d.utility.Vector3dVector([color] * len(lines))
-    return ls
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(world_pts)
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    mesh.paint_uniform_color(color)
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def make_dot(position, radius, color):
+    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius, resolution=10)
+    sphere.translate(np.asarray(position))
+    sphere.paint_uniform_color(color)
+    sphere.compute_vertex_normals()
+    return sphere
 
 
 def main():
@@ -211,8 +221,8 @@ def main():
                     help="Parent folder containing cam0..cam5 (or a single cam folder)")
     ap.add_argument("--first", type=int, default=5,
                     help="Leading frames per camera (default: 5)")
-    ap.add_argument("--size", type=float, default=0.3,
-                    help="Frustum depth in metres (default: 0.3)")
+    ap.add_argument("--size", type=float, default=0.12,
+                    help="Frustum depth in metres (default: 0.12)")
     ap.add_argument("--hfov", type=float, default=90.0,
                     help="Horizontal FOV in degrees, for drawing only (default: 90)")
     ap.add_argument("--vfov", type=float, default=60.0,
@@ -251,11 +261,15 @@ def main():
 
     geometries: list = []
 
-    # World ENU axes at origin: red=East, green=North, blue=Up.
-    world_axes = o3d.geometry.TriangleMesh.create_coordinate_frame(
-        size=args.size * 3.0, origin=[0, 0, 0]
+    # Single black dot at the world origin (was the big ENU triad).
+    origin_dot = make_dot(
+        position=[0, 0, 0],
+        radius=args.size * 0.25,
+        color=[0.0, 0.0, 0.0],
     )
-    geometries.append(world_axes)
+    geometries.append(origin_dot)
+
+    apex_radius = args.size * 0.12
 
     sorted_cams = sorted(cam_poses.keys())
     for cam_idx, cam in enumerate(sorted_cams):
@@ -263,10 +277,11 @@ def main():
         for r in cam_poses[cam]:
             x, y = lonlat_to_local_xy(r["lon"], r["lat"], lon_ref, lat_ref)
             z = r["alt"] - alt_ref
+            position = [x, y, z]
 
             R = euler_to_rotmat(r["heading"], r["pitch"], r["roll"])
             frustum = make_frustum(
-                position=[x, y, z],
+                position=position,
                 R=R,
                 depth=args.size,
                 hfov_deg=args.hfov,
@@ -274,6 +289,7 @@ def main():
                 color=color,
             )
             geometries.append(frustum)
+            geometries.append(make_dot(position, apex_radius, color))
 
     print("\nCamera colors:")
     for cam_idx, cam in enumerate(sorted_cams):
@@ -290,7 +306,8 @@ def main():
         )
     print("Adjacent cams on a 360 rig should differ by ~60 deg in heading.")
     print("Identical numbers between two cams = a duplicate-trajectory bug.")
-    print("\nLarge triad at origin = world ENU (red=E, green=N, blue=Up).")
+    print("\nBlack dot = world origin (first frame, first camera).")
+    print("Each colored dot = a camera position; the colored pyramid points where it looks.")
     print("Drag to rotate, scroll to zoom, right-drag to pan. Press Q to quit.")
 
     o3d.visualization.draw_geometries(
