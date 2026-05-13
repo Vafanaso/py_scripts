@@ -138,25 +138,33 @@ def lonlat_to_local_xy(lon, lat, lon_ref, lat_ref):
     return x, y
 
 
-def euler_to_rotmat(yaw_deg, pitch_deg, roll_deg) -> np.ndarray:
+def euler_to_rotmat(heading_deg, pitch_deg, roll_deg) -> np.ndarray:
     """
-    body x = right, body y = forward (optical axis), body z = up
-    yaw  : clockwise from north (GPSImgDirection convention)
-    pitch: about body x (nose up positive)
-    roll : about body y (right wing down positive)
+    Decode (heading, pitch, roll) from the XMP/EXIF tags back into the
+    body-to-world rotation matrix, reversing exactly what the pipeline does in
+    calculate_exif_meta.py:
+
+        to_euler     = inverse(R_body_to_world).as_euler("ZYX")
+        yaw_to_heading = [euler[2], euler[1], euler[0] + 90]
+
+    So to recover R_body_to_world we:
+        1. yaw_math = heading - 90       (undo the +90 offset)
+        2. build R_inv via scipy "ZYX" intrinsic = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+        3. R_body_to_world = R_inv.T     (undo the inversion)
     """
-    y = np.deg2rad(yaw_deg)
+    yaw = np.deg2rad(heading_deg - 90.0)
     p = np.deg2rad(pitch_deg)
     r = np.deg2rad(roll_deg)
 
-    cy, sy = np.cos(y), np.sin(y)
-    Rz = np.array([[cy, sy, 0], [-sy, cy, 0], [0, 0, 1]])
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
     cp, sp = np.cos(p), np.sin(p)
-    Rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
     cr, sr = np.cos(r), np.sin(r)
-    Ry = np.array([[cr, 0, sr], [0, 1, 0], [-sr, 0, cr]])
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
 
-    return Rz @ Rx @ Ry
+    R_inv = Rz @ Ry @ Rx
+    return R_inv.T
 
 
 def make_frustum(position, R, depth, hfov_deg, vfov_deg, color):
