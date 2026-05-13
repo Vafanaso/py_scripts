@@ -167,23 +167,49 @@ def euler_to_rotmat(heading_deg, pitch_deg, roll_deg) -> np.ndarray:
     return R_inv.T
 
 
-def make_frustum(position, R, depth, hfov_deg, vfov_deg, color):
+FORWARD_AXIS_MAP = {
+    "y":  ("y", +1),  "+y": ("y", +1),
+    "-y": ("y", -1),
+    "x":  ("x", +1),  "+x": ("x", +1),
+    "-x": ("x", -1),
+    "z":  ("z", +1),  "+z": ("z", +1),
+    "-z": ("z", -1),
+}
+
+
+def _build_body_corners(forward_axis: str, depth: float, hw: float, hh: float):
+    """Return 5 body-frame points (apex + 4 base corners) for a frustum whose
+    optical axis is the given body axis ('+y', '-x', etc.)."""
+    axis, sign = FORWARD_AXIS_MAP[forward_axis]
+    d = sign * depth
+
+    if axis == "y":
+        return np.array([
+            [0, 0, 0],
+            [+hw, d, +hh], [-hw, d, +hh], [-hw, d, -hh], [+hw, d, -hh],
+        ])
+    if axis == "x":
+        return np.array([
+            [0, 0, 0],
+            [d, +hw, +hh], [d, -hw, +hh], [d, -hw, -hh], [d, +hw, -hh],
+        ])
+    # z
+    return np.array([
+        [0, 0, 0],
+        [+hw, +hh, d], [-hw, +hh, d], [-hw, -hh, d], [+hw, -hh, d],
+    ])
+
+
+def make_frustum(position, R, depth, hfov_deg, vfov_deg, color, forward_axis):
     """
     Build a SOLID camera frustum as an Open3D TriangleMesh (open at the back).
 
-    The apex is at `position`. The forward axis (body Y) points down the
-    optical axis. Base is at distance `depth` ahead, sized by hfov/vfov.
+    `forward_axis` is which body-frame axis is the optical axis: one of
+    'y', '+y', '-y', 'x', '+x', '-x', 'z', '+z', '-z'.
     """
     hw = depth * np.tan(np.deg2rad(hfov_deg) / 2)
     hh = depth * np.tan(np.deg2rad(vfov_deg) / 2)
-
-    body_pts = np.array([
-        [0.0, 0.0, 0.0],          # 0 apex
-        [+hw, depth, +hh],        # 1 top-right
-        [-hw, depth, +hh],        # 2 top-left
-        [-hw, depth, -hh],        # 3 bottom-left
-        [+hw, depth, -hh],        # 4 bottom-right
-    ])
+    body_pts = _build_body_corners(forward_axis, depth, hw, hh)
 
     world_pts = (R @ body_pts.T).T + np.asarray(position)
 
@@ -227,6 +253,10 @@ def main():
                     help="Horizontal FOV in degrees, for drawing only (default: 90)")
     ap.add_argument("--vfov", type=float, default=60.0,
                     help="Vertical FOV in degrees, for drawing only (default: 60)")
+    ap.add_argument("--forward-axis", default="y",
+                    choices=list(FORWARD_AXIS_MAP.keys()),
+                    help="Which body axis is the camera optical axis "
+                         "(try: y, x, z, -y, -x, -z). Default: y")
     args = ap.parse_args()
 
     if not args.path.exists():
@@ -287,6 +317,7 @@ def main():
                 hfov_deg=args.hfov,
                 vfov_deg=args.vfov,
                 color=color,
+                forward_axis=args.forward_axis,
             )
             geometries.append(frustum)
             geometries.append(make_dot(position, apex_radius, color))
@@ -306,6 +337,30 @@ def main():
         )
     print("Adjacent cams on a 360 rig should differ by ~60 deg in heading.")
     print("Identical numbers between two cams = a duplicate-trajectory bug.")
+
+    # For each camera, show where each body axis ends up pointing in the world,
+    # so you can tell which body axis is actually the optical axis.
+    #   bearing = compass heading (0=N, 90=E, 180=S, 270=W)
+    #   elev    = degrees above horizon (+ up, - down)
+    def world_dir(R, axis):
+        v = R @ axis
+        bearing = (np.degrees(np.arctan2(v[0], v[1])) + 360) % 360  # X=E, Y=N
+        elev = np.degrees(np.arctan2(v[2], np.hypot(v[0], v[1])))
+        return bearing, elev
+
+    print("\nWorld-frame direction of each body axis per camera "
+          "(bearing deg from north / elevation deg above horizon):")
+    print(f"  {'cam':<6}   {'body +X':>20}   {'body +Y':>20}   {'body +Z':>20}")
+    for cam in sorted_cams:
+        r = cam_poses[cam][0]
+        R = euler_to_rotmat(r["heading"], r["pitch"], r["roll"])
+        bx, ex = world_dir(R, np.array([1.0, 0.0, 0.0]))
+        by, ey = world_dir(R, np.array([0.0, 1.0, 0.0]))
+        bz, ez = world_dir(R, np.array([0.0, 0.0, 1.0]))
+        print(f"  {cam:<6}   {bx:>7.1f}/{ex:+6.1f}     "
+              f"{by:>7.1f}/{ey:+6.1f}     {bz:>7.1f}/{ez:+6.1f}")
+    print("Pick the column where the values look most like a sensible camera "
+          "layout, and pass it as --forward-axis (y/x/z, or with - prefix).")
     print("\nBlack dot = world origin (first frame, first camera).")
     print("Each colored dot = a camera position; the colored pyramid points where it looks.")
     print("Drag to rotate, scroll to zoom, right-drag to pan. Press Q to quit.")
