@@ -1,18 +1,16 @@
 """
-Visualize the first 5 frames per camera as 3D pose triads using Open3D.
+Visualize the first N frames per camera as 3D camera frustums using Open3D.
+
+Each camera pose is drawn as a small pyramid: the apex sits at the GPS
+position, and the rectangular base shows where the camera "sees". One color
+per camera, so you can read which cam0..cam5 frustum is which.
 
 Reads EXIF (GPS lat/lon/alt) and XMP (PoseHeadingDegrees, PosePitchDegrees,
-PoseRollDegrees) for each JPG and renders a coordinate frame at every pose.
-You get an interactive 3D window you can rotate/zoom with the mouse.
-
-Color convention of each triad:
-    red   = X (camera right)
-    green = Y (camera forward / optical axis)
-    blue  = Z (camera up)
+PoseRollDegrees) for each JPG.
 
 Run:
     python show_poses_o3d.py <path-to-georeferenced_frames>
-    python show_poses_o3d.py <path> --first 10 --axis-len 0.5
+    python show_poses_o3d.py <path> --first 5 --size 0.3 --hfov 90 --vfov 60
 
 Requires (one extra install on top of the existing venv):
     pip install open3d
@@ -30,6 +28,16 @@ import pyexiv2
 XMP_HEADING = "Xmp.GPano.PoseHeadingDegrees"
 XMP_PITCH = "Xmp.GPano.PosePitchDegrees"
 XMP_ROLL = "Xmp.GPano.PoseRollDegrees"
+
+
+CAM_COLORS = [
+    [1.00, 0.00, 0.00],  # cam0  red
+    [0.00, 0.60, 0.00],  # cam1  green
+    [0.00, 0.40, 1.00],  # cam2  blue
+    [1.00, 0.55, 0.00],  # cam3  orange
+    [0.65, 0.00, 0.85],  # cam4  purple
+    [0.00, 0.75, 0.75],  # cam5  cyan
+]
 
 
 def _rational_to_float(rat) -> float:
@@ -132,7 +140,7 @@ def lonlat_to_local_xy(lon, lat, lon_ref, lat_ref):
 
 def euler_to_rotmat(yaw_deg, pitch_deg, roll_deg) -> np.ndarray:
     """
-    body x = right, body y = forward, body z = up
+    body x = right, body y = forward (optical axis), body z = up
     yaw  : clockwise from north (GPSImgDirection convention)
     pitch: about body x (nose up positive)
     roll : about body y (right wing down positive)
@@ -151,17 +159,56 @@ def euler_to_rotmat(yaw_deg, pitch_deg, roll_deg) -> np.ndarray:
     return Rz @ Rx @ Ry
 
 
+def make_frustum(position, R, depth, hfov_deg, vfov_deg, color):
+    """
+    Build a wireframe camera frustum as an Open3D LineSet.
+
+    The apex is at `position`. The forward axis (body Y) points down the
+    optical axis. Base is at distance `depth` ahead, sized by hfov/vfov.
+    """
+    hw = depth * np.tan(np.deg2rad(hfov_deg) / 2)  # half width  along body x
+    hh = depth * np.tan(np.deg2rad(vfov_deg) / 2)  # half height along body z
+
+    # 5 points in body frame: apex + 4 base corners
+    body_pts = np.array([
+        [0.0, 0.0, 0.0],          # 0 apex
+        [+hw, depth, +hh],        # 1 top-right
+        [-hw, depth, +hh],        # 2 top-left
+        [-hw, depth, -hh],        # 3 bottom-left
+        [+hw, depth, -hh],        # 4 bottom-right
+    ])
+
+    world_pts = (R @ body_pts.T).T + np.asarray(position)
+
+    lines = [
+        [0, 1], [0, 2], [0, 3], [0, 4],   # apex to corners
+        [1, 2], [2, 3], [3, 4], [4, 1],   # base rectangle
+        [1, 2],                           # (top edge highlighted by repeat)
+    ]
+
+    ls = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(world_pts),
+        lines=o3d.utility.Vector2iVector(lines),
+    )
+    ls.colors = o3d.utility.Vector3dVector([color] * len(lines))
+    return ls
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("path", type=Path,
-                    help="Parent folder containing cam0..cam5 subfolders (or a single cam folder)")
+                    help="Parent folder containing cam0..cam5 (or a single cam folder)")
     ap.add_argument("--first", type=int, default=5,
-                    help="How many leading frames per camera (default: 5)")
-    ap.add_argument("--axis-len", type=float, default=0.3,
-                    help="Length of each pose-axis arrow in metres (default: 0.3)")
+                    help="Leading frames per camera (default: 5)")
+    ap.add_argument("--size", type=float, default=0.3,
+                    help="Frustum depth in metres (default: 0.3)")
+    ap.add_argument("--hfov", type=float, default=90.0,
+                    help="Horizontal FOV in degrees, for drawing only (default: 90)")
+    ap.add_argument("--vfov", type=float, default=60.0,
+                    help="Vertical FOV in degrees, for drawing only (default: 60)")
     args = ap.parse_args()
 
     if not args.path.exists():
@@ -173,7 +220,6 @@ def main():
         print(f"No .jpg files found at {args.path}", file=sys.stderr)
         sys.exit(1)
 
-    # take only the first N per camera and read their poses
     print(f"Reading first {args.first} poses per camera from {args.path}")
     cam_poses: dict[str, list[dict]] = {}
     for cam, files in cam_files.items():
@@ -184,51 +230,55 @@ def main():
                 poses.append(p)
         if poses:
             cam_poses[cam] = poses
-        print(f"  {cam}: {len(poses)}/{min(args.first, len(files))} poses with full data")
+        print(f"  {cam}: {len(poses)}/{min(args.first, len(files))} with full pose")
 
     if not cam_poses:
         print("No poses with full lat/lon/yaw/pitch/roll — nothing to draw.",
               file=sys.stderr)
         sys.exit(1)
 
-    # common ENU origin = first pose of the alphabetically first camera
     first_cam = sorted(cam_poses.keys())[0]
     ref = cam_poses[first_cam][0]
     lon_ref, lat_ref, alt_ref = ref["lon"], ref["lat"], ref["alt"]
 
     geometries: list = []
 
-    # World axes at the origin (bigger, for orientation)
+    # World ENU axes at origin: red=East, green=North, blue=Up.
     world_axes = o3d.geometry.TriangleMesh.create_coordinate_frame(
-        size=args.axis_len * 3.0, origin=[0, 0, 0]
+        size=args.size * 3.0, origin=[0, 0, 0]
     )
     geometries.append(world_axes)
 
-    for cam, poses in sorted(cam_poses.items()):
-        for r in poses:
+    sorted_cams = sorted(cam_poses.keys())
+    for cam_idx, cam in enumerate(sorted_cams):
+        color = CAM_COLORS[cam_idx % len(CAM_COLORS)]
+        for r in cam_poses[cam]:
             x, y = lonlat_to_local_xy(r["lon"], r["lat"], lon_ref, lat_ref)
             z = r["alt"] - alt_ref
 
             R = euler_to_rotmat(r["heading"], r["pitch"], r["roll"])
-            T = np.eye(4)
-            T[:3, :3] = R
-            T[:3, 3] = [x, y, z]
-
-            triad = o3d.geometry.TriangleMesh.create_coordinate_frame(
-                size=args.axis_len, origin=[0, 0, 0]
+            frustum = make_frustum(
+                position=[x, y, z],
+                R=R,
+                depth=args.size,
+                hfov_deg=args.hfov,
+                vfov_deg=args.vfov,
+                color=color,
             )
-            triad.transform(T)
-            geometries.append(triad)
+            geometries.append(frustum)
 
-    print("\nOpening Open3D viewer — drag with the mouse to rotate, scroll to zoom.")
-    print("Big triad at origin = world ENU axes (east, north, up).")
-    print("Press Q or close the window to exit.")
+    print("\nCamera colors:")
+    for cam_idx, cam in enumerate(sorted_cams):
+        c = CAM_COLORS[cam_idx % len(CAM_COLORS)]
+        print(f"  {cam}: RGB ({c[0]:.2f}, {c[1]:.2f}, {c[2]:.2f})")
+    print("\nLarge triad at origin = world ENU (red=E, green=N, blue=Up).")
+    print("Drag to rotate, scroll to zoom, right-drag to pan. Press Q to quit.")
+
     o3d.visualization.draw_geometries(
         geometries,
-        window_name="Camera poses (first frames)",
+        window_name="Camera frustums (first frames per cam)",
         width=1200,
         height=800,
-        point_show_normal=False,
     )
 
 
