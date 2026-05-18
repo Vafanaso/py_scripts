@@ -283,8 +283,8 @@ def main():
                          "':50' for first 50, '10:' from 10 to end. Overrides --first.")
     ap.add_argument("--skip", type=int, default=1,
                     help="Step between frames (default: 1). E.g. --skip 3 keeps every 3rd frame.")
-    ap.add_argument("--no-trajectory", action="store_true",
-                    help="Disable the polyline connecting consecutive camera positions.")
+    ap.add_argument("--trajectory", action="store_true",
+                    help="Draw a polyline connecting consecutive camera positions per cam.")
     ap.add_argument("--size", type=float, default=0.12,
                     help="Frustum depth in metres (default: 0.12)")
     ap.add_argument("--hfov", type=float, default=90.0,
@@ -377,7 +377,7 @@ def main():
             geometries.append(frustum)
             geometries.append(make_dot(position, apex_radius, color))
 
-        if not args.no_trajectory:
+        if args.trajectory:
             traj = make_trajectory(cam_positions, color)
             if traj is not None:
                 geometries.append(traj)
@@ -423,7 +423,7 @@ def main():
           "layout, and pass it as --forward-axis (y/x/z, or with - prefix).")
     print("\nBlack dot = world origin (first frame, first camera).")
     print("Each colored dot = a camera position; the colored pyramid points where it looks.")
-    if not args.no_trajectory:
+    if args.trajectory:
         print("Colored polyline = trajectory through consecutive frames of that camera.")
     print("Left-drag = rotate, scroll = zoom, "
           "Ctrl+left-drag or middle-mouse-drag = pan/move. Press Q to quit.")
