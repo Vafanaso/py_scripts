@@ -11,6 +11,9 @@ PoseRollDegrees) for each JPG.
 Run:
     python show_poses_o3d.py <path-to-georeferenced_frames>
     python show_poses_o3d.py <path> --first 5 --size 0.3 --hfov 90 --vfov 60
+    python show_poses_o3d.py <path> --range 10:50          # frames [10, 50)
+    python show_poses_o3d.py <path> --range :              # all frames
+    python show_poses_o3d.py <path> --range 0:200 --skip 3 # every 3rd frame in [0, 200)
 
 Requires (one extra install on top of the existing venv):
     pip install open3d
@@ -238,6 +241,34 @@ def make_dot(position, radius, color):
     return sphere
 
 
+def make_trajectory(positions, color):
+    """LineSet connecting consecutive camera positions, showing the path."""
+    if len(positions) < 2:
+        return None
+    pts = np.asarray(positions, dtype=float)
+    lines = np.array([[i, i + 1] for i in range(len(pts) - 1)], dtype=int)
+    colors = np.tile(np.asarray(color, dtype=float), (len(lines), 1))
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(pts)
+    ls.lines = o3d.utility.Vector2iVector(lines)
+    ls.colors = o3d.utility.Vector3dVector(colors)
+    return ls
+
+
+def parse_range(s: str, total: int) -> tuple[int, int]:
+    """Parse '10:50', ':50', '10:', or ':' against a total list length."""
+    if ":" not in s:
+        raise ValueError(f"--range must contain ':' (got {s!r})")
+    a, b = s.split(":", 1)
+    start = int(a) if a.strip() else 0
+    end = int(b) if b.strip() else total
+    if start < 0:
+        start = max(total + start, 0)
+    if end < 0:
+        end = max(total + end, 0)
+    return start, end
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -246,7 +277,14 @@ def main():
     ap.add_argument("path", type=Path,
                     help="Parent folder containing cam0..cam5 (or a single cam folder)")
     ap.add_argument("--first", type=int, default=5,
-                    help="Leading frames per camera (default: 5)")
+                    help="Leading frames per camera (default: 5). Ignored if --range is given.")
+    ap.add_argument("--range", dest="frame_range", type=str, default=None,
+                    help="Frame index range per camera, e.g. '10:50', ':' for all, "
+                         "':50' for first 50, '10:' from 10 to end. Overrides --first.")
+    ap.add_argument("--skip", type=int, default=1,
+                    help="Step between frames (default: 1). E.g. --skip 3 keeps every 3rd frame.")
+    ap.add_argument("--no-trajectory", action="store_true",
+                    help="Disable the polyline connecting consecutive camera positions.")
     ap.add_argument("--size", type=float, default=0.12,
                     help="Frustum depth in metres (default: 0.12)")
     ap.add_argument("--hfov", type=float, default=90.0,
@@ -259,6 +297,10 @@ def main():
                          "(try: y, x, z, -y, -x, -z). Default: y")
     args = ap.parse_args()
 
+    if args.skip < 1:
+        print(f"Error: --skip must be >= 1 (got {args.skip})", file=sys.stderr)
+        sys.exit(1)
+
     if not args.path.exists():
         print(f"Error: path not found: {args.path}", file=sys.stderr)
         sys.exit(1)
@@ -268,17 +310,28 @@ def main():
         print(f"No .jpg files found at {args.path}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Reading first {args.first} poses per camera from {args.path}")
+    if args.frame_range is not None:
+        sel_desc = f"range {args.frame_range} (skip {args.skip})"
+    else:
+        sel_desc = f"first {args.first} (skip {args.skip})"
+    print(f"Reading {sel_desc} poses per camera from {args.path}")
+
     cam_poses: dict[str, list[dict]] = {}
     for cam, files in cam_files.items():
+        if args.frame_range is not None:
+            start, end = parse_range(args.frame_range, len(files))
+        else:
+            start, end = 0, min(args.first, len(files))
+        chosen = files[start:end:args.skip]
         poses = []
-        for jpg in files[: args.first]:
+        for jpg in chosen:
             p = read_pose(jpg)
             if p is not None:
                 poses.append(p)
         if poses:
             cam_poses[cam] = poses
-        print(f"  {cam}: {len(poses)}/{min(args.first, len(files))} with full pose")
+        print(f"  {cam}: {len(poses)}/{len(chosen)} with full pose "
+              f"(from {start}:{end}:{args.skip} of {len(files)} files)")
 
     if not cam_poses:
         print("No poses with full lat/lon/yaw/pitch/roll — nothing to draw.",
@@ -304,10 +357,12 @@ def main():
     sorted_cams = sorted(cam_poses.keys())
     for cam_idx, cam in enumerate(sorted_cams):
         color = CAM_COLORS[cam_idx % len(CAM_COLORS)]
+        cam_positions: list[list[float]] = []
         for r in cam_poses[cam]:
             x, y = lonlat_to_local_xy(r["lon"], r["lat"], lon_ref, lat_ref)
             z = r["alt"] - alt_ref
             position = [x, y, z]
+            cam_positions.append(position)
 
             R = euler_to_rotmat(r["heading"], r["pitch"], r["roll"])
             frustum = make_frustum(
@@ -321,6 +376,11 @@ def main():
             )
             geometries.append(frustum)
             geometries.append(make_dot(position, apex_radius, color))
+
+        if not args.no_trajectory:
+            traj = make_trajectory(cam_positions, color)
+            if traj is not None:
+                geometries.append(traj)
 
     print("\nCamera colors:")
     for cam_idx, cam in enumerate(sorted_cams):
@@ -363,6 +423,8 @@ def main():
           "layout, and pass it as --forward-axis (y/x/z, or with - prefix).")
     print("\nBlack dot = world origin (first frame, first camera).")
     print("Each colored dot = a camera position; the colored pyramid points where it looks.")
+    if not args.no_trajectory:
+        print("Colored polyline = trajectory through consecutive frames of that camera.")
     print("Drag to rotate, scroll to zoom, right-drag to pan. Press Q to quit.")
 
     o3d.visualization.draw_geometries(
