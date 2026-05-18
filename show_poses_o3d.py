@@ -425,7 +425,8 @@ def main():
     print("Each colored dot = a camera position; the colored pyramid points where it looks.")
     if not args.no_trajectory:
         print("Colored polyline = trajectory through consecutive frames of that camera.")
-    print("Drag to rotate, scroll to zoom, right-drag to pan. Press Q to quit.")
+    print("Left-drag = rotate, scroll = zoom, "
+          "Ctrl+left-drag or middle-mouse-drag = pan/move. Press Q to quit.")
 
     o3d.visualization.draw_geometries(
         geometries,
