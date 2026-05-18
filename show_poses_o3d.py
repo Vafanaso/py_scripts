@@ -285,6 +285,9 @@ def main():
                     help="Step between frames (default: 1). E.g. --skip 3 keeps every 3rd frame.")
     ap.add_argument("--trajectory", action="store_true",
                     help="Draw a polyline connecting consecutive camera positions per cam.")
+    ap.add_argument("--dump-gps", action="store_true",
+                    help="Print picked frames' lat/lon/alt + step distance per cam, "
+                         "for debugging clustering / 'doubles'.")
     ap.add_argument("--size", type=float, default=0.12,
                     help="Frustum depth in metres (default: 0.12)")
     ap.add_argument("--hfov", type=float, default=90.0,
@@ -341,6 +344,22 @@ def main():
     first_cam = sorted(cam_poses.keys())[0]
     ref = cam_poses[first_cam][0]
     lon_ref, lat_ref, alt_ref = ref["lon"], ref["lat"], ref["alt"]
+
+    if args.dump_gps:
+        print("\nPicked frames per cam (local XY metres relative to ref, step-to-prev metres):")
+        for cam in sorted(cam_poses.keys()):
+            print(f"  [{cam}]")
+            prev = None
+            for r in cam_poses[cam]:
+                x, y = lonlat_to_local_xy(r["lon"], r["lat"], lon_ref, lat_ref)
+                z = r["alt"] - alt_ref
+                if prev is None:
+                    step = 0.0
+                else:
+                    step = float(np.hypot(np.hypot(x - prev[0], y - prev[1]), z - prev[2]))
+                print(f"    {r['file']:<40} x={x:+9.3f}  y={y:+9.3f}  z={z:+7.3f}  "
+                      f"step={step:7.3f} m")
+                prev = (x, y, z)
 
     geometries: list = []
 
